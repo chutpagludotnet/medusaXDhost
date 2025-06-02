@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 import tempfile
 import psutil
+import html
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -142,9 +143,10 @@ class ScriptManager:
             if not script_path.exists():
                 return False, "Script not found"
 
-            # Use virtual environment Python if available
+            # Check if virtual environment exists, otherwise use system Python
             python_path = venv_dir / ('Scripts' if os.name == 'nt' else 'bin') / 'python'
             if not python_path.exists():
+                logger.info(f"Virtual environment not found for user {user_id}, using system Python")
                 python_path = sys.executable
 
             # Create log file
@@ -213,7 +215,7 @@ class ScriptManager:
         else:
             return False, "Script not running or not found"
 
-# Enhanced logging functions
+# Enhanced logging functions with HTML parsing to avoid markdown issues
 async def log_user_action(context: ContextTypes.DEFAULT_TYPE, user_id: int, username: str, action: str, details: str = "", file_path: str = None):
     """Log user action to the log channel with optional file forwarding"""
     if not LOG_CHANNEL_ID:
@@ -221,19 +223,25 @@ async def log_user_action(context: ContextTypes.DEFAULT_TYPE, user_id: int, user
 
     try:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        # Escape HTML characters to prevent parsing issues
+        safe_username = html.escape(username)
+        safe_action = html.escape(action)
+        safe_details = html.escape(details)
+
         log_message = f"""
-🔍 **User Action Log**
-👤 User: {username} (`{user_id}`)
-⚡ Action: {action}
-📝 Details: {details}
+🔍 <b>User Action Log</b>
+👤 User: {safe_username} (<code>{user_id}</code>)
+⚡ Action: {safe_action}
+📝 Details: {safe_details}
 🕐 Time: {timestamp}
         """
 
-        # Send text log first
+        # Send text log first using HTML parse mode
         await context.bot.send_message(
             chat_id=LOG_CHANNEL_ID,
             text=log_message,
-            parse_mode='Markdown'
+            parse_mode='HTML'
         )
 
         # If there's a file to forward, send it too
@@ -243,8 +251,8 @@ async def log_user_action(context: ContextTypes.DEFAULT_TYPE, user_id: int, user
                     chat_id=LOG_CHANNEL_ID,
                     document=open(file_path, 'rb'),
                     filename=Path(file_path).name,
-                    caption=f"📎 **File from user {username}** (`{user_id}`)\n🕐 {timestamp}",
-                    parse_mode='Markdown'
+                    caption=f"📎 <b>File from user {safe_username}</b> (<code>{user_id}</code>)\n🕐 {timestamp}",
+                    parse_mode='HTML'
                 )
                 logger.info(f"Forwarded file {file_path} to log channel for user {user_id}")
             except Exception as file_error:
@@ -252,8 +260,8 @@ async def log_user_action(context: ContextTypes.DEFAULT_TYPE, user_id: int, user
                 # Send error notification
                 await context.bot.send_message(
                     chat_id=LOG_CHANNEL_ID,
-                    text=f"❌ **Failed to forward file:** {Path(file_path).name}\nError: {str(file_error)}",
-                    parse_mode='Markdown'
+                    text=f"❌ <b>Failed to forward file:</b> {html.escape(Path(file_path).name)}\nError: {html.escape(str(file_error))}",
+                    parse_mode='HTML'
                 )
 
         logger.info(f"Logged action: {action} for user {user_id}")
@@ -268,18 +276,23 @@ async def forward_file_to_log(context: ContextTypes.DEFAULT_TYPE, user_id: int, 
     try:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
 
+        # Escape HTML characters
+        safe_username = html.escape(username)
+        safe_file_name = html.escape(file_name)
+        safe_action = html.escape(action)
+
         # Forward the file with caption
         await context.bot.send_document(
             chat_id=LOG_CHANNEL_ID,
             document=file_id,
             caption=f"""
-📎 **File Upload Log**
-👤 User: {username} (`{user_id}`)
-📁 File: {file_name}
-⚡ Action: {action}
+📎 <b>File Upload Log</b>
+👤 User: {safe_username} (<code>{user_id}</code>)
+📁 File: {safe_file_name}
+⚡ Action: {safe_action}
 🕐 Time: {timestamp}
             """,
-            parse_mode='Markdown'
+            parse_mode='HTML'
         )
 
         logger.info(f"Forwarded Telegram file {file_name} to log channel for user {user_id}")
