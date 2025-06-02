@@ -144,69 +144,63 @@ class ScriptManager:
 
     @staticmethod
     async def run_script(user_id: int, script_name: str) -> tuple[bool, str]:
-        """Run a user's script with robust Python path detection"""
+        """Run a user's script - bulletproof version"""
         try:
             scripts_dir = UserManager.get_user_scripts_dir(user_id)
             logs_dir = UserManager.get_user_logs_dir(user_id)
-            venv_dir = UserManager.get_user_venv_dir(user_id)
 
             script_path = scripts_dir / script_name
             if not script_path.exists():
                 return False, "Script not found"
 
-            # Start with system Python as default
+            # ALWAYS start with system Python - this is guaranteed to work on Render
             python_path = sys.executable
             python_source = "system"
 
-            # Try to find a working Python in virtual environment
-            if venv_dir.exists():
-                # Try different possible Python executable names/locations
-                possible_python_paths = [
-                    venv_dir / 'bin' / 'python',           # Linux/Mac
-                    venv_dir / 'bin' / 'python3',          # Linux/Mac alternative
-                    venv_dir / 'Scripts' / 'python.exe',   # Windows
-                    venv_dir / 'Scripts' / 'python',       # Windows alternative
-                ]
-
-                venv_python_found = False
-                for possible_path in possible_python_paths:
-                    if possible_path.exists():
-                        # Double-check the file is executable and works
-                        try:
-                            # Test if the Python executable actually works
-                            test_result = subprocess.run([
-                                str(possible_path), '--version'
-                            ], capture_output=True, text=True, timeout=10)
-
-                            if test_result.returncode == 0:
-                                python_path = possible_path
-                                python_source = "virtual environment"
-                                venv_python_found = True
-                                logger.info(f"Using virtual environment Python for user {user_id}: {python_path}")
-                                break
-                        except Exception as e:
-                            logger.warning(f"Venv Python test failed for {possible_path}: {e}")
-                            continue
-
-                if not venv_python_found:
-                    logger.info(f"No working Python found in venv for user {user_id}, cleaning up and using system Python")
-                    UserManager.cleanup_broken_venv(user_id)
-                    python_path = sys.executable
-                    python_source = "system (venv cleanup)"
-            else:
-                logger.info(f"No virtual environment found for user {user_id}, using system Python: {python_path}")
-
-            # Final verification that our selected Python actually exists and works
+            # Try to use virtual environment Python if it exists and works
             try:
-                verify_result = subprocess.run([
-                    str(python_path), '--version'
-                ], capture_output=True, text=True, timeout=10)
+                venv_dir = UserManager.get_user_venv_dir(user_id)
 
-                if verify_result.returncode != 0:
-                    return False, f"Selected Python executable is not working: {python_path}"
+                if venv_dir.exists():
+                    # Try common venv Python locations
+                    venv_python_candidates = [
+                        venv_dir / 'bin' / 'python',           # Linux (Render uses this)
+                        venv_dir / 'bin' / 'python3',          # Linux alternative
+                        venv_dir / 'Scripts' / 'python.exe',   # Windows
+                        venv_dir / 'Scripts' / 'python',       # Windows alternative
+                    ]
 
-            except Exception as e:
-                return False, f"Cannot verify Python executable {python_path}: {str(e)}"
+                    for candidate in venv_python_candidates:
+                        if candidate.exists() and candidate.is_file():
+                            try:
+                                # Quick test to see if this Python works
+                                test_result = subprocess.run([
+                                    str(candidate), '-c', 'import sys; print(sys.version)'
+                                ], capture_output=True, text=True, timeout=5)
+
+                                if test_result.returncode == 0:
+                                    python_path = candidate
+                                    python_source = "virtual environment"
+                                    logger.info(f"Using venv Python for user {user_id}: {python_path}")
+                                    break
+                            except Exception as test_error:
+                                logger.warning(f"Venv Python test failed for {candidate}: {test_error}")
+                                continue
+
+                    if python_source == "system":
+                        logger.info(f"No working venv Python found for user {user_id}, using system Python")
+                else:
+                    logger.info(f"No venv directory for user {user_id}, using system Python")
+
+            except Exception as venv_error:
+                logger.warning(f"Venv detection error for user {user_id}: {venv_error}")
+
+            # Final verification
+            if not Path(python_path).exists():
+                logger.error(f"Python path doesn't exist: {python_path}")
+                return False, f"Python executable not found: {python_path}"
+
+            logger.info(f"Running {script_name} for user {user_id} with {python_source} Python: {python_path}")
 
             # Create log file
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -214,8 +208,6 @@ class ScriptManager:
 
             # Start process
             process_key = f"{user_id}_{script_name}"
-
-            logger.info(f"Starting script {script_name} for user {user_id} with {python_source} Python: {python_path}")
 
             with open(log_file, 'w') as log:
                 process = subprocess.Popen([
@@ -229,7 +221,7 @@ class ScriptManager:
 
                 RUNNING_PROCESSES[process_key] = process
 
-            return True, f"Script {script_name} started successfully with {python_source} Python!"
+            return True, f"Script {script_name} started with {python_source} Python!"
 
         except Exception as e:
             logger.error(f"Error running script {script_name} for user {user_id}: {str(e)}")
@@ -274,7 +266,7 @@ class ScriptManager:
         else:
             return False, "Script not running or not found"
 
-# Enhanced logging functions with HTML parsing to avoid markdown issues
+# Enhanced logging functions
 async def log_user_action(context: ContextTypes.DEFAULT_TYPE, user_id: int, username: str, action: str, details: str = "", file_path: str = None):
     """Log user action to the log channel with optional file forwarding"""
     if not LOG_CHANNEL_ID:
@@ -316,12 +308,6 @@ async def log_user_action(context: ContextTypes.DEFAULT_TYPE, user_id: int, user
                 logger.info(f"Forwarded file {file_path} to log channel for user {user_id}")
             except Exception as file_error:
                 logger.error(f"Failed to forward file to log channel: {file_error}")
-                # Send error notification
-                await context.bot.send_message(
-                    chat_id=LOG_CHANNEL_ID,
-                    text=f"❌ <b>Failed to forward file:</b> {html.escape(Path(file_path).name)}\nError: {html.escape(str(file_error))}",
-                    parse_mode='HTML'
-                )
 
         logger.info(f"Logged action: {action} for user {user_id}")
     except Exception as e:
@@ -557,7 +543,7 @@ async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Save the file
     try:
-        scripts_dir = UserManager.get_user_scripts_dir(user.id)
+        scripts_dir = UserManager.get_user_scripts_dir(user_id)
         file = await context.bot.get_file(update.message.document.file_id)
         file_path = scripts_dir / update.message.document.file_name
 
