@@ -237,9 +237,7 @@ async def log_user_action(context: ContextTypes.DEFAULT_TYPE, user_id: int, user
     except Exception as e:
         logger.error(f"Failed to log user action: {e}")
 
-# [Include all the same command handlers from the previous code]
-# ... (keeping the rest of the handlers the same as in the original code)
-
+# Command handlers
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     user = update.effective_user
@@ -266,9 +264,487 @@ Use /upload to begin hosting your Python script!
     await update.message.reply_text(welcome_text, parse_mode='Markdown')
     await log_user_action(context, user.id, user.username or "Unknown", "/start")
 
-# ... [Include all other handlers from the original code] ...
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /help command"""
+    user = update.effective_user
 
-# Error handler with better logging for worker environment
+    help_text = """
+🆘 **MedusaXD HOSTING - Help**
+
+**Available Commands:**
+/start - Welcome message and bot info
+/upload - Upload a Python project (requirements.txt → files → main script)
+/run - Run one of your uploaded scripts
+/stop - Stop a running script
+/delete - Delete a script file
+/logs - View execution logs for your scripts
+/edit - Edit your Python scripts
+/info - View bot statistics
+/ping - Check if bot is alive
+
+**Upload Process:**
+1. Use /upload
+2. Send requirements.txt (optional)
+3. Send other project files
+4. Send your main Python script
+5. Use /run to execute!
+
+**Need Support?** Contact @medusaXD
+    """
+
+    await update.message.reply_text(help_text, parse_mode='Markdown')
+    await log_user_action(context, user.id, user.username or "Unknown", "/help")
+
+async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /ping command"""
+    user = update.effective_user
+    await update.message.reply_text("🏓 Pong!")
+    await log_user_action(context, user.id, user.username or "Unknown", "/ping")
+
+async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /info command"""
+    user = update.effective_user
+
+    # Calculate statistics
+    total_users = len(list(USER_DATA_DIR.iterdir())) if USER_DATA_DIR.exists() else 0
+    total_files = 0
+    running_scripts = len(RUNNING_PROCESSES)
+
+    # Count total files
+    for user_dir in USER_DATA_DIR.iterdir():
+        if user_dir.is_dir():
+            scripts_dir = user_dir / 'scripts'
+            if scripts_dir.exists():
+                total_files += len(list(scripts_dir.glob('*.py')))
+
+    # Calculate uptime
+    uptime_seconds = int(time.time() - BOT_START_TIME)
+    uptime_hours = uptime_seconds // 3600
+    uptime_minutes = (uptime_seconds % 3600) // 60
+
+    # System info
+    memory_usage = psutil.virtual_memory().percent
+    cpu_usage = psutil.cpu_percent()
+
+    info_text = f"""
+📊 **Bot Statistics**
+
+👥 Total Users: `{total_users}`
+📁 Total Files: `{total_files}`
+🏃 Running Scripts: `{running_scripts}`
+⏰ Uptime: `{uptime_hours}h {uptime_minutes}m`
+
+💻 **System Info**
+🧠 Memory Usage: `{memory_usage:.1f}%`
+⚡ CPU Usage: `{cpu_usage:.1f}%`
+
+🤖 **MedusaXD HOSTING v1.0**
+    """
+
+    await update.message.reply_text(info_text, parse_mode='Markdown')
+    await log_user_action(context, user.id, user.username or "Unknown", "/info")
+
+# Upload conversation handlers
+async def upload_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start the upload process"""
+    user = update.effective_user
+
+    await update.message.reply_text(
+        "📄 Please send your *requirements.txt* file as a document.\n\n"
+        "If you don't have dependencies, send /skip to continue.",
+        parse_mode='Markdown'
+    )
+
+    context.user_data['upload_step'] = 'requirements'
+    await log_user_action(context, user.id, user.username or "Unknown", "/upload", "Started upload process")
+
+    return UPLOAD_REQUIREMENTS
+
+async def handle_requirements(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle requirements.txt upload"""
+    user = update.effective_user
+
+    if update.message.text == '/skip':
+        await update.message.reply_text(
+            "📄 Please send your other project files as documents.\n\n"
+            "When done, send /done to continue to main script upload."
+        )
+        return UPLOAD_FILES
+
+    if not update.message.document:
+        await update.message.reply_text("Please send a document file or /skip")
+        return UPLOAD_REQUIREMENTS
+
+    # Download and process requirements.txt
+    try:
+        file = await context.bot.get_file(update.message.document.file_id)
+        file_content = await file.download_as_bytearray()
+        requirements_content = file_content.decode('utf-8')
+
+        # Install requirements
+        success, message = await ScriptManager.install_requirements(user.id, requirements_content)
+
+        if success:
+            await update.message.reply_text(f"✅ {message}")
+            await update.message.reply_text(
+                "📄 Please send your other project files as documents.\n\n"
+                "When done, send /done to continue to main script upload."
+            )
+            await log_user_action(context, user.id, user.username or "Unknown", "requirements.txt", "Uploaded and installed")
+            return UPLOAD_FILES
+        else:
+            await update.message.reply_text(f"❌ {message}")
+            return UPLOAD_REQUIREMENTS
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error processing requirements: {str(e)}")
+        return UPLOAD_REQUIREMENTS
+
+async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle additional files upload"""
+    user = update.effective_user
+
+    if update.message.text == '/done':
+        await update.message.reply_text(
+            "🐍 Now please send your main Python script as a document."
+        )
+        return UPLOAD_MAIN_SCRIPT
+
+    if not update.message.document:
+        await update.message.reply_text("Please send a document file or /done when finished")
+        return UPLOAD_FILES
+
+    # Save the file
+    try:
+        scripts_dir = UserManager.get_user_scripts_dir(user.id)
+        file = await context.bot.get_file(update.message.document.file_id)
+        file_path = scripts_dir / update.message.document.file_name
+
+        await file.download_to_drive(file_path)
+        await update.message.reply_text(f"✅ File *{update.message.document.file_name}* saved!", parse_mode='Markdown')
+        await log_user_action(context, user.id, user.username or "Unknown", "file_upload", update.message.document.file_name)
+
+        return UPLOAD_FILES
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error saving file: {str(e)}")
+        return UPLOAD_FILES
+
+async def handle_main_script(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle main script upload"""
+    user = update.effective_user
+
+    if not update.message.document:
+        await update.message.reply_text("Please send your Python script as a document")
+        return UPLOAD_MAIN_SCRIPT
+
+    # Save the main script
+    try:
+        scripts_dir = UserManager.get_user_scripts_dir(user.id)
+        file = await context.bot.get_file(update.message.document.file_id)
+        file_path = scripts_dir / update.message.document.file_name
+
+        await file.download_to_drive(file_path)
+
+        await update.message.reply_text(
+            f"📂 File *{update.message.document.file_name}* uploaded and dependencies installed successfully!\n\n"
+            f"You can now use /run to execute your script!",
+            parse_mode='Markdown'
+        )
+
+        await log_user_action(context, user.id, user.username or "Unknown", "main_script", update.message.document.file_name)
+
+        return ConversationHandler.END
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error saving script: {str(e)}")
+        return UPLOAD_MAIN_SCRIPT
+
+async def cancel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel upload process"""
+    await update.message.reply_text("Upload process cancelled.")
+    return ConversationHandler.END
+
+# Script management commands
+async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /run command"""
+    user = update.effective_user
+    scripts_dir = UserManager.get_user_scripts_dir(user.id)
+
+    # Get available scripts
+    python_files = list(scripts_dir.glob('*.py'))
+
+    if not python_files:
+        await update.message.reply_text(
+            "❌ No Python scripts found. Use /upload to upload your scripts first."
+        )
+        return
+
+    # Create inline keyboard
+    keyboard = []
+    for script in python_files:
+        keyboard.append([InlineKeyboardButton(
+            script.name, 
+            callback_data=f"run_{script.name}"
+        )])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "🔹 *Select a script to run:*",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+    await log_user_action(context, user.id, user.username or "Unknown", "/run")
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /stop command"""
+    user = update.effective_user
+    running_scripts = ScriptManager.get_running_scripts(user.id)
+
+    if not running_scripts:
+        await update.message.reply_text("❌ No scripts are currently running.")
+        return
+
+    # Create inline keyboard
+    keyboard = []
+    for script in running_scripts:
+        keyboard.append([InlineKeyboardButton(
+            script, 
+            callback_data=f"stop_{script}"
+        )])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "🛑 *Select a script to stop:*",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+    await log_user_action(context, user.id, user.username or "Unknown", "/stop")
+
+async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /delete command"""
+    user = update.effective_user
+    scripts_dir = UserManager.get_user_scripts_dir(user.id)
+
+    # Get available files
+    all_files = list(scripts_dir.iterdir())
+
+    if not all_files:
+        await update.message.reply_text("❌ No files found.")
+        return
+
+    # Create inline keyboard
+    keyboard = []
+    for file in all_files:
+        keyboard.append([InlineKeyboardButton(
+            file.name, 
+            callback_data=f"delete_{file.name}"
+        )])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "🗑️ *Select a file to delete:*",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+    await log_user_action(context, user.id, user.username or "Unknown", "/delete")
+
+async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /logs command"""
+    user = update.effective_user
+    logs_dir = UserManager.get_user_logs_dir(user.id)
+
+    # Get available log files
+    log_files = list(logs_dir.glob('*.log'))
+
+    if not log_files:
+        await update.message.reply_text("❌ No log files found.")
+        return
+
+    # Group logs by script name
+    scripts = {}
+    for log_file in log_files:
+        script_name = log_file.name.split('_')[0] + '.py'
+        if script_name not in scripts:
+            scripts[script_name] = []
+        scripts[script_name].append(log_file)
+
+    # Create inline keyboard
+    keyboard = []
+    for script_name in scripts:
+        keyboard.append([InlineKeyboardButton(
+            script_name, 
+            callback_data=f"logs_{script_name}"
+        )])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "📋 *Select a script to view logs:*",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+    await log_user_action(context, user.id, user.username or "Unknown", "/logs")
+
+async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /edit command"""
+    user = update.effective_user
+    scripts_dir = UserManager.get_user_scripts_dir(user.id)
+
+    # Get available scripts
+    python_files = list(scripts_dir.glob('*.py'))
+
+    if not python_files:
+        await update.message.reply_text("❌ No Python scripts found.")
+        return
+
+    # Create inline keyboard
+    keyboard = []
+    for script in python_files:
+        keyboard.append([InlineKeyboardButton(
+            script.name, 
+            callback_data=f"edit_{script.name}"
+        )])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "✏️ *Select a script to edit:*",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+    await log_user_action(context, user.id, user.username or "Unknown", "/edit")
+
+# Callback query handlers
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle button callbacks"""
+    query = update.callback_query
+    user = query.from_user
+    data = query.data
+
+    await query.answer()
+
+    if data.startswith('run_'):
+        script_name = data[4:]
+        success, message = await ScriptManager.run_script(user.id, script_name)
+
+        if success:
+            await query.edit_message_text(f"🚀 Running {script_name}...\n\n{message}")
+        else:
+            await query.edit_message_text(f"❌ {message}")
+
+        await log_user_action(context, user.id, user.username or "Unknown", "run_script", script_name)
+
+    elif data.startswith('stop_'):
+        script_name = data[5:]
+        success, message = ScriptManager.stop_script(user.id, script_name)
+
+        await query.edit_message_text(f"🛑 {message}")
+        await log_user_action(context, user.id, user.username or "Unknown", "stop_script", script_name)
+
+    elif data.startswith('delete_'):
+        file_name = data[7:]
+        scripts_dir = UserManager.get_user_scripts_dir(user.id)
+        file_path = scripts_dir / file_name
+
+        try:
+            file_path.unlink()
+            await query.edit_message_text(f"🗑️ File {file_name} deleted successfully!")
+            await log_user_action(context, user.id, user.username or "Unknown", "delete_file", file_name)
+        except Exception as e:
+            await query.edit_message_text(f"❌ Error deleting file: {str(e)}")
+
+    elif data.startswith('logs_'):
+        script_name = data[5:]
+        logs_dir = UserManager.get_user_logs_dir(user.id)
+
+        # Find latest log for this script
+        log_files = list(logs_dir.glob(f"{script_name.replace('.py', '')}_*.log"))
+
+        if log_files:
+            latest_log = max(log_files, key=lambda x: x.stat().st_mtime)
+
+            try:
+                log_content = latest_log.read_text()
+
+                # Truncate if too long
+                if len(log_content) > 4000:
+                    log_content = log_content[-4000:] + "\n\n[... truncated to last 4000 characters]"
+
+                await query.edit_message_text(
+                    f"📋 **Latest log for {script_name}:**\n\n```\n{log_content}\n```",
+                    parse_mode='Markdown'
+                )
+            except Exception as e:
+                await query.edit_message_text(f"❌ Error reading log: {str(e)}")
+        else:
+            await query.edit_message_text(f"❌ No logs found for {script_name}")
+
+        await log_user_action(context, user.id, user.username or "Unknown", "view_logs", script_name)
+
+    elif data.startswith('edit_'):
+        script_name = data[5:]
+        scripts_dir = UserManager.get_user_scripts_dir(user.id)
+        script_path = scripts_dir / script_name
+
+        try:
+            # Send the file back to user
+            await context.bot.send_document(
+                chat_id=query.message.chat_id,
+                document=open(script_path, 'rb'),
+                filename=script_name,
+                caption=f"📝 Here's your script *{script_name}*. Send the edited version as a document to replace it.",
+                parse_mode='Markdown'
+            )
+            await query.edit_message_text(f"📝 Script {script_name} sent for editing!")
+            await log_user_action(context, user.id, user.username or "Unknown", "edit_script", script_name)
+        except Exception as e:
+            await query.edit_message_text(f"❌ Error sending file: {str(e)}")
+
+# Admin commands
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle admin commands"""
+    user = update.effective_user
+
+    if user.id not in ADMIN_USER_IDS:
+        await update.message.reply_text("❌ Access denied. Admin only command.")
+        return
+
+    # Admin panel
+    total_users = len(list(USER_DATA_DIR.iterdir())) if USER_DATA_DIR.exists() else 0
+    total_files = 0
+    running_scripts = len(RUNNING_PROCESSES)
+
+    # Count total files
+    for user_dir in USER_DATA_DIR.iterdir():
+        if user_dir.is_dir():
+            scripts_dir = user_dir / 'scripts'
+            if scripts_dir.exists():
+                total_files += len(list(scripts_dir.glob('*.py')))
+
+    admin_text = f"""
+🔧 **Admin Panel**
+
+📊 **Statistics:**
+👥 Total Users: `{total_users}`
+📁 Total Files: `{total_files}`
+🏃 Running Scripts: `{running_scripts}`
+
+💻 **System:**
+🧠 Memory: `{psutil.virtual_memory().percent:.1f}%`
+⚡ CPU: `{psutil.cpu_percent():.1f}%`
+💾 Disk: `{psutil.disk_usage('/').percent:.1f}%`
+
+**Running Processes:**
+{chr(10).join([f"• {key}" for key in RUNNING_PROCESSES.keys()]) if RUNNING_PROCESSES else "• None"}
+    """
+
+    await update.message.reply_text(admin_text, parse_mode='Markdown')
+
+# Error handler
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Handle errors"""
     logger.error(f"Exception while handling an update: {context.error}", exc_info=True)
