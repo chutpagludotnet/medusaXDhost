@@ -85,6 +85,17 @@ class UserManager:
         logs_dir.mkdir(exist_ok=True)
         return logs_dir
 
+    @staticmethod
+    def cleanup_broken_venv(user_id: int):
+        """Remove broken virtual environment"""
+        try:
+            venv_dir = UserManager.get_user_venv_dir(user_id)
+            if venv_dir.exists():
+                shutil.rmtree(venv_dir)
+                logger.info(f"Cleaned up broken venv for user {user_id}")
+        except Exception as e:
+            logger.error(f"Failed to cleanup venv for user {user_id}: {e}")
+
 class ScriptManager:
     """Manage script execution and logging"""
 
@@ -133,7 +144,7 @@ class ScriptManager:
 
     @staticmethod
     async def run_script(user_id: int, script_name: str) -> tuple[bool, str]:
-        """Run a user's script"""
+        """Run a user's script with robust Python path detection"""
         try:
             scripts_dir = UserManager.get_user_scripts_dir(user_id)
             logs_dir = UserManager.get_user_logs_dir(user_id)
@@ -143,25 +154,59 @@ class ScriptManager:
             if not script_path.exists():
                 return False, "Script not found"
 
-            # Determine which Python to use
-            python_path = sys.executable  # Default to system Python
+            # Start with system Python as default
+            python_path = sys.executable
+            python_source = "system"
 
-            # Check if virtual environment directory exists
+            # Try to find a working Python in virtual environment
             if venv_dir.exists():
-                # Check if python executable exists in venv
-                venv_python = venv_dir / ('Scripts' if os.name == 'nt' else 'bin') / 'python'
-                if venv_python.exists():
-                    python_path = venv_python
-                    logger.info(f"Using virtual environment Python for user {user_id}: {python_path}")
-                else:
-                    logger.info(f"Virtual environment exists but Python executable not found for user {user_id}, using system Python: {python_path}")
+                # Try different possible Python executable names/locations
+                possible_python_paths = [
+                    venv_dir / 'bin' / 'python',           # Linux/Mac
+                    venv_dir / 'bin' / 'python3',          # Linux/Mac alternative
+                    venv_dir / 'Scripts' / 'python.exe',   # Windows
+                    venv_dir / 'Scripts' / 'python',       # Windows alternative
+                ]
+
+                venv_python_found = False
+                for possible_path in possible_python_paths:
+                    if possible_path.exists():
+                        # Double-check the file is executable and works
+                        try:
+                            # Test if the Python executable actually works
+                            test_result = subprocess.run([
+                                str(possible_path), '--version'
+                            ], capture_output=True, text=True, timeout=10)
+
+                            if test_result.returncode == 0:
+                                python_path = possible_path
+                                python_source = "virtual environment"
+                                venv_python_found = True
+                                logger.info(f"Using virtual environment Python for user {user_id}: {python_path}")
+                                break
+                        except Exception as e:
+                            logger.warning(f"Venv Python test failed for {possible_path}: {e}")
+                            continue
+
+                if not venv_python_found:
+                    logger.info(f"No working Python found in venv for user {user_id}, cleaning up and using system Python")
+                    UserManager.cleanup_broken_venv(user_id)
+                    python_path = sys.executable
+                    python_source = "system (venv cleanup)"
             else:
                 logger.info(f"No virtual environment found for user {user_id}, using system Python: {python_path}")
 
-            # Verify the selected Python executable exists
-            if not Path(python_path).exists():
-                logger.error(f"Python executable not found: {python_path}")
-                return False, f"Python executable not found: {python_path}"
+            # Final verification that our selected Python actually exists and works
+            try:
+                verify_result = subprocess.run([
+                    str(python_path), '--version'
+                ], capture_output=True, text=True, timeout=10)
+
+                if verify_result.returncode != 0:
+                    return False, f"Selected Python executable is not working: {python_path}"
+
+            except Exception as e:
+                return False, f"Cannot verify Python executable {python_path}: {str(e)}"
 
             # Create log file
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -170,7 +215,7 @@ class ScriptManager:
             # Start process
             process_key = f"{user_id}_{script_name}"
 
-            logger.info(f"Starting script {script_name} for user {user_id} with Python: {python_path}")
+            logger.info(f"Starting script {script_name} for user {user_id} with {python_source} Python: {python_path}")
 
             with open(log_file, 'w') as log:
                 process = subprocess.Popen([
@@ -184,7 +229,7 @@ class ScriptManager:
 
                 RUNNING_PROCESSES[process_key] = process
 
-            return True, f"Script {script_name} started successfully!"
+            return True, f"Script {script_name} started successfully with {python_source} Python!"
 
         except Exception as e:
             logger.error(f"Error running script {script_name} for user {user_id}: {str(e)}")
