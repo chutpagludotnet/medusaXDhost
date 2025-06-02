@@ -213,8 +213,9 @@ class ScriptManager:
         else:
             return False, "Script not running or not found"
 
-async def log_user_action(context: ContextTypes.DEFAULT_TYPE, user_id: int, username: str, action: str, details: str = ""):
-    """Log user action to the log channel"""
+# Enhanced logging functions
+async def log_user_action(context: ContextTypes.DEFAULT_TYPE, user_id: int, username: str, action: str, details: str = "", file_path: str = None):
+    """Log user action to the log channel with optional file forwarding"""
     if not LOG_CHANNEL_ID:
         return
 
@@ -228,14 +229,62 @@ async def log_user_action(context: ContextTypes.DEFAULT_TYPE, user_id: int, user
 🕐 Time: {timestamp}
         """
 
+        # Send text log first
         await context.bot.send_message(
             chat_id=LOG_CHANNEL_ID,
             text=log_message,
             parse_mode='Markdown'
         )
+
+        # If there's a file to forward, send it too
+        if file_path and Path(file_path).exists():
+            try:
+                await context.bot.send_document(
+                    chat_id=LOG_CHANNEL_ID,
+                    document=open(file_path, 'rb'),
+                    filename=Path(file_path).name,
+                    caption=f"📎 **File from user {username}** (`{user_id}`)\n🕐 {timestamp}",
+                    parse_mode='Markdown'
+                )
+                logger.info(f"Forwarded file {file_path} to log channel for user {user_id}")
+            except Exception as file_error:
+                logger.error(f"Failed to forward file to log channel: {file_error}")
+                # Send error notification
+                await context.bot.send_message(
+                    chat_id=LOG_CHANNEL_ID,
+                    text=f"❌ **Failed to forward file:** {Path(file_path).name}\nError: {str(file_error)}",
+                    parse_mode='Markdown'
+                )
+
         logger.info(f"Logged action: {action} for user {user_id}")
     except Exception as e:
         logger.error(f"Failed to log user action: {e}")
+
+async def forward_file_to_log(context: ContextTypes.DEFAULT_TYPE, user_id: int, username: str, file_id: str, file_name: str, action: str):
+    """Forward a Telegram file directly to the log channel"""
+    if not LOG_CHANNEL_ID:
+        return
+
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        # Forward the file with caption
+        await context.bot.send_document(
+            chat_id=LOG_CHANNEL_ID,
+            document=file_id,
+            caption=f"""
+📎 **File Upload Log**
+👤 User: {username} (`{user_id}`)
+📁 File: {file_name}
+⚡ Action: {action}
+🕐 Time: {timestamp}
+            """,
+            parse_mode='Markdown'
+        )
+
+        logger.info(f"Forwarded Telegram file {file_name} to log channel for user {user_id}")
+    except Exception as e:
+        logger.error(f"Failed to forward Telegram file to log channel: {e}")
 
 # Command handlers
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -369,11 +418,20 @@ async def handle_requirements(update: Update, context: ContextTypes.DEFAULT_TYPE
             "📄 Please send your other project files as documents.\n\n"
             "When done, send /done to continue to main script upload."
         )
+        await log_user_action(context, user.id, user.username or "Unknown", "requirements.txt", "Skipped")
         return UPLOAD_FILES
 
     if not update.message.document:
         await update.message.reply_text("Please send a document file or /skip")
         return UPLOAD_REQUIREMENTS
+
+    # Forward file to log channel FIRST
+    await forward_file_to_log(
+        context, user.id, user.username or "Unknown", 
+        update.message.document.file_id, 
+        update.message.document.file_name, 
+        "requirements.txt upload"
+    )
 
     # Download and process requirements.txt
     try:
@@ -394,10 +452,12 @@ async def handle_requirements(update: Update, context: ContextTypes.DEFAULT_TYPE
             return UPLOAD_FILES
         else:
             await update.message.reply_text(f"❌ {message}")
+            await log_user_action(context, user.id, user.username or "Unknown", "requirements.txt", f"Installation failed: {message}")
             return UPLOAD_REQUIREMENTS
 
     except Exception as e:
         await update.message.reply_text(f"❌ Error processing requirements: {str(e)}")
+        await log_user_action(context, user.id, user.username or "Unknown", "requirements.txt", f"Processing error: {str(e)}")
         return UPLOAD_REQUIREMENTS
 
 async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -408,11 +468,20 @@ async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "🐍 Now please send your main Python script as a document."
         )
+        await log_user_action(context, user.id, user.username or "Unknown", "additional_files", "Finished uploading additional files")
         return UPLOAD_MAIN_SCRIPT
 
     if not update.message.document:
         await update.message.reply_text("Please send a document file or /done when finished")
         return UPLOAD_FILES
+
+    # Forward file to log channel FIRST
+    await forward_file_to_log(
+        context, user.id, user.username or "Unknown", 
+        update.message.document.file_id, 
+        update.message.document.file_name, 
+        "project file upload"
+    )
 
     # Save the file
     try:
@@ -422,12 +491,13 @@ async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await file.download_to_drive(file_path)
         await update.message.reply_text(f"✅ File *{update.message.document.file_name}* saved!", parse_mode='Markdown')
-        await log_user_action(context, user.id, user.username or "Unknown", "file_upload", update.message.document.file_name)
+        await log_user_action(context, user.id, user.username or "Unknown", "file_upload", update.message.document.file_name, str(file_path))
 
         return UPLOAD_FILES
 
     except Exception as e:
         await update.message.reply_text(f"❌ Error saving file: {str(e)}")
+        await log_user_action(context, user.id, user.username or "Unknown", "file_upload", f"Error saving {update.message.document.file_name}: {str(e)}")
         return UPLOAD_FILES
 
 async def handle_main_script(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -437,6 +507,14 @@ async def handle_main_script(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not update.message.document:
         await update.message.reply_text("Please send your Python script as a document")
         return UPLOAD_MAIN_SCRIPT
+
+    # Forward file to log channel FIRST
+    await forward_file_to_log(
+        context, user.id, user.username or "Unknown", 
+        update.message.document.file_id, 
+        update.message.document.file_name, 
+        "main script upload"
+    )
 
     # Save the main script
     try:
@@ -452,17 +530,20 @@ async def handle_main_script(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode='Markdown'
         )
 
-        await log_user_action(context, user.id, user.username or "Unknown", "main_script", update.message.document.file_name)
+        await log_user_action(context, user.id, user.username or "Unknown", "main_script", f"Uploaded {update.message.document.file_name}", str(file_path))
 
         return ConversationHandler.END
 
     except Exception as e:
         await update.message.reply_text(f"❌ Error saving script: {str(e)}")
+        await log_user_action(context, user.id, user.username or "Unknown", "main_script", f"Error saving {update.message.document.file_name}: {str(e)}")
         return UPLOAD_MAIN_SCRIPT
 
 async def cancel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel upload process"""
+    user = update.effective_user
     await update.message.reply_text("Upload process cancelled.")
+    await log_user_action(context, user.id, user.username or "Unknown", "/cancel", "Upload process cancelled")
     return ConversationHandler.END
 
 # Script management commands
@@ -743,6 +824,44 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
 
     await update.message.reply_text(admin_text, parse_mode='Markdown')
+    await log_user_action(context, user.id, user.username or "Unknown", "/admin", "Accessed admin panel")
+
+# Handle document uploads for file replacement during editing
+async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle document uploads for file replacement"""
+    user = update.effective_user
+
+    if not update.message.document:
+        return
+
+    # Check if this is a file replacement (outside of upload conversation)
+    if context.user_data.get('upload_step') is None:
+        scripts_dir = UserManager.get_user_scripts_dir(user.id)
+        file_name = update.message.document.file_name
+
+        # Forward file to log channel
+        await forward_file_to_log(
+            context, user.id, user.username or "Unknown", 
+            update.message.document.file_id, 
+            file_name, 
+            "file replacement/edit"
+        )
+
+        # Save the replacement file
+        try:
+            file = await context.bot.get_file(update.message.document.file_id)
+            file_path = scripts_dir / file_name
+
+            await file.download_to_drive(file_path)
+            await update.message.reply_text(
+                f"✅ File *{file_name}* updated successfully!",
+                parse_mode='Markdown'
+            )
+            await log_user_action(context, user.id, user.username or "Unknown", "file_replacement", file_name, str(file_path))
+
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error updating file: {str(e)}")
+            await log_user_action(context, user.id, user.username or "Unknown", "file_replacement", f"Error updating {file_name}: {str(e)}")
 
 # Error handler
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -786,6 +905,9 @@ def main():
     application.add_handler(CommandHandler('admin', admin_command))
     application.add_handler(upload_conv_handler)
     application.add_handler(CallbackQueryHandler(button_callback))
+
+    # Handle document uploads outside of conversation (for file replacement)
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document_upload))
 
     # Add error handler
     application.add_error_handler(error_handler)
